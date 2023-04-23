@@ -3,12 +3,13 @@ package main
 import (
 	"bytes"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"log"
 	"os"
 	"strings"
 	"text/template"
+	"path"
+	_ "embed"
 
 	"google.golang.org/protobuf/compiler/protogen"
 	"google.golang.org/protobuf/proto"
@@ -17,12 +18,19 @@ import (
 	"golang.org/x/tools/imports"
 )
 
+
+//go:embed server_template/server.tmpl
+var defaultServerTemplate []byte
+
+//go:embed server_template/go_mod.tmpl
+var defaultServerGoMod []byte
+
 func main() {
 	// Tip of the hat to Tim Coulson
 	// https://medium.com/@tim.r.coulson/writing-a-protoc-plugin-with-google-golang-org-protobuf-cd5aa75f5777
 
 	// Protoc passes pluginpb.CodeGeneratorRequest in via stdin
-	// marshalled with Protobuf
+	// marshalled with Protobuf; read and decode it
 	input, _ := ioutil.ReadAll(os.Stdin)
 	var request pluginpb.CodeGeneratorRequest
 	if err := proto.Unmarshal(input, &request); err != nil {
@@ -36,6 +44,8 @@ func main() {
 		log.Fatalf("error initializing plugin: %v", err)
 	}
 
+	// We don't do anything special for the "optional" marker, but we have to
+	// declare that we support it so that protogen will invoke our plugin.
 	plugin.SupportedFeatures = uint64(pluginpb.CodeGeneratorResponse_FEATURE_PROTO3_OPTIONAL)
 
 	protos := make([]*descriptorpb.FileDescriptorProto, len(plugin.Files))
@@ -49,30 +59,17 @@ func main() {
 		params[split[0]] = split[1]
 	}
 
-	server_go_buf := new(bytes.Buffer)
 	generateOptions := Options{
-		writer:    server_go_buf,
 		adminPort: params["admin-port"],
 		grpcAddr:  fmt.Sprintf("%s:%s", params["grpc-address"], params["grpc-port"]),
 		templateDir:  params["template-dir"],
 	}
-	err = generateServer(protos, &generateOptions)
+	fw := fileWriter{plugin:plugin}
+	err = generateServer(fw, protos, &generateOptions)
 
 	if err != nil {
 		log.Fatalf("Failed to generate server %v", err)
 	}
-
-	server_go := plugin.NewGeneratedFile("server.go", ".")
-	server_go.Write(server_go_buf.Bytes())
-
-	// Template a go.mod for the server so we don't have to hit the
-	// Internet for "go mod tidy" etc.
-	go_mod_tmpl, err := readTemplate(generateOptions.templateDir, "go.mod")
-	if err != nil {
-		log.Fatalf("Failed to load go.mod from template directory: %v", err)
-	}
-	go_mod := plugin.NewGeneratedFile("go.mod",".")
-	go_mod.Write([]byte(go_mod_tmpl))
 
 	// Generate a response from our plugin and marshall as protobuf
 	out, err := proto.Marshal(plugin.Response())
@@ -80,15 +77,13 @@ func main() {
 		log.Fatalf("error marshalling plugin response: %v", err)
 	}
 
-	// Create the required go.mod and go.sum
-
 	// Write the response to stdout, to be picked up by protoc
 	os.Stdout.Write(out)
 }
 
 type generatorParam struct {
 	Services     []Service
-	Dependencies map[string]string
+	Imports      map[string]string
 	GrpcAddr     string
 	AdminPort    string
 	PbPath       string
@@ -112,6 +107,23 @@ type methodTemplate struct {
 	Output      string
 }
 
+// mock-able adapter for the protobuf plugin file output, so we can easily
+// intercept the files and test the generator separately.
+type FileWriter interface {
+	AddGeneratedFile(filename string, goImportPath protogen.GoImportPath, content []byte) error
+}
+// Default implementation sends files to protobuf server
+type fileWriter struct{
+	plugin *protogen.Plugin
+}
+func (fw fileWriter) AddGeneratedFile(filename string, goImportPath protogen.GoImportPath, content []byte) error {
+	of := fw.plugin.NewGeneratedFile(filename, goImportPath)
+	if _, err := of.Write(content); err != nil {
+		return fmt.Errorf("while writing output %s: %v", filename, err)
+	}
+	return nil
+}
+
 const (
 	methodTypeStandard = "standard"
 	// server to client stream
@@ -122,31 +134,60 @@ const (
 )
 
 type Options struct {
-	writer    io.Writer
 	grpcAddr  string
 	adminPort string
 	format    bool
 	templateDir  string
 }
 
-func init() {
-}
-
-func readTemplate(templateDir string, filename string) (string, error) {
-	filePath := templateDir + "/" + filename
+/*
+ * Read a file from the template directory, for when we're using
+ * a server template that's not embedded in the binary.
+ */
+func readTemplateFile(templateDir string, filename string) ([]byte, error) {
+	// read the template file from the filesystem
+	filePath := path.Join(templateDir, filename)
 	log.Printf("Loading template %s...", filePath)
 	f, err := os.ReadFile(filePath)
 	if err != nil {
-		return "", fmt.Errorf("reading template %s: %v", filePath, err)
+		return nil, fmt.Errorf("reading template %s: %v", filePath, err)
 	}
-	return string(f), nil
+	return f, nil
 }
 
-func generateServer(protos []*descriptorpb.FileDescriptorProto, opt *Options) error {
-	services := extractServices(protos)
-	deps := resolveDependencies(protos)
+/*
+ * Read a template file for generating the server sources.
+ *
+ * The default server source template is embedded into this plugin at build
+ * time using go:embed, but it may be overridden by a --template-dir option on
+ * the command line options.
+ */
+func readTemplate(templateDir string, filename string) ([]byte, error) {
+	if templateDir == "" {
+		switch filename {
+		case "server.tmpl":
+			return defaultServerTemplate, nil
+		case "go_mod.tmpl":
+			return defaultServerGoMod, nil
+		default:
+			return nil, fmt.Errorf("No template file named \"%s\" in compiled-in template", filename)
+		}
+	} else {
+		tmpl, err := readTemplateFile(templateDir, filename)
+		if err != nil {
+			return nil, err
+		}
+		return tmpl, err
+	}
+}
 
-	//log.Printf("protoc-gen-gripmock invoked with opts %#v", opt)
+/*
+ * Load server.tmpl and other template files, apply template params, and append
+ * each file to the output to be sent in the protobuf reply.
+ */
+func generateServer(fw FileWriter, protos []*descriptorpb.FileDescriptorProto, opt *Options) error {
+	services := extractServices(protos)
+	imports := resolveImports(protos)
 
 	if opt == nil {
 		opt = &Options{}
@@ -154,26 +195,37 @@ func generateServer(protos []*descriptorpb.FileDescriptorProto, opt *Options) er
 	if opt.templateDir == "" {
 		opt.templateDir = "."
 	}
-	if opt.writer == nil {
-		opt.writer = os.Stdout
-	}
-
-	serverTemplate, err := readTemplate(opt.templateDir, "server.tmpl")
-	if err != nil {
-		return err
-	}
 
 	templateParams := generatorParam{
 		Services:     services,
-		Dependencies: deps,
+		Imports:      imports,
 		GrpcAddr:     opt.grpcAddr,
 		AdminPort:    opt.adminPort,
 	}
 
-	//log.Printf("Preparing to generate with template parameters %#v", templateParams)
+	if err := generateFile(fw, opt, templateParams, "server.tmpl", "server.go"); err != nil {
+		return err
+	}
 
-	tmpl := template.New("server.tmpl")
-	tmpl, err = tmpl.Parse(serverTemplate)
+	if err := generateFile(fw, opt, templateParams, "go_mod.tmpl", "go.mod"); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+/*
+ * Load, template, and write one file from the server template.
+ */
+func generateFile(fw FileWriter, opt *Options, templateParams generatorParam, templateFileName string, outFileName string) error {
+
+	templateFile, err := readTemplate(opt.templateDir, templateFileName)
+	if err != nil {
+		return err
+	}
+
+	tmpl := template.New(templateFileName)
+	tmpl, err = tmpl.Parse(string(templateFile))
 	if err != nil {
 		return fmt.Errorf("template parse %v", err)
 	}
@@ -190,11 +242,21 @@ func generateServer(protos []*descriptorpb.FileDescriptorProto, opt *Options) er
 		return fmt.Errorf("formatting: %v \n%s", err, string(byt))
 	}
 
-	_, err = opt.writer.Write(bytProcessed)
-	return err
+	if err := fw.AddGeneratedFile(outFileName, ".", bytProcessed); err != nil {
+		return err
+	}
+
+	return nil
 }
 
-func resolveDependencies(protos []*descriptorpb.FileDescriptorProto) map[string]string {
+/*
+ * Find the go packages for the generated golang files relating to each
+ * protocol and import them into the generated server. Because gripmock munges
+ * the go_package in the proto files, this will find the ones that gripmock's
+ * own protogen invocation creates in the same directory as the generated
+ * server.
+ */
+func resolveImports(protos []*descriptorpb.FileDescriptorProto) map[string]string {
 
 	deps := map[string]string{}
 	for _, proto := range protos {
@@ -359,3 +421,5 @@ func isKeyword(word string) bool {
 
 	return false
 }
+
+// vim: ts=4 sw=4 ai noet

@@ -38,7 +38,7 @@ const (
 
 func main() {
 	outputPointer := flag.String("o", "generated", "directory to output generated files and binaries. Default is \"generated\"")
-	templateDir := flag.String("template-dir", "server_template", "path to directory containing server.tmpl and its go.mod, default \"server_tmpl\"")
+	templateDir := flag.String("template-dir", "", "path to directory containing server.tmpl and its go.mod, uses compiled-in template by default")
 	grpcPort := flag.String("grpc-port", "4770", "Port of gRPC tcp server")
 	grpcBindAddr := flag.String("grpc-listen", "", "Adress the gRPC server will bind to. Default to localhost, set to 0.0.0.0 to use from another machine")
 	adminport := flag.String("admin-port", "4771", "Port of stub admin server")

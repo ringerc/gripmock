@@ -21,12 +21,9 @@ ADD fix_gopackage.sh /bin/fix_gopackage.sh
 RUN mkdir -p /gripmock
 COPY . /gripmock
 
-RUN ls /gripmock
-RUN ls /gripmock/server_template
-
 # Pre-download modules used for server builds
 RUN cd /gripmock/server_template && \
-    go mod download -x
+    go mod download
 
 # install generator plugin
 WORKDIR /gripmock/protoc-gen-gripmock
@@ -51,4 +48,4 @@ RUN find /gripmock -name "*.pb.go" -delete -type f
 
 EXPOSE 4770 4771
 
-ENTRYPOINT ["gripmock", "--template-dir=/gripmock/server_template"]
+ENTRYPOINT ["gripmock"]

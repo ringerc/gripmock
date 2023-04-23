@@ -34,9 +34,10 @@ import (
 	otlpzipkin "go.opentelemetry.io/otel/exporters/zipkin"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 )
-{{ range $package, $alias := .Dependencies }}
+{{ range $package, $alias := .Imports }}
 import {{$alias}} "{{$package}}"
 {{end}}
+
 const (
 	TCP_ADDRESS  = "{{.GrpcAddr}}"
 	HTTP_PORT = ":{{.AdminPort}}"
