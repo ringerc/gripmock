@@ -1,4 +1,4 @@
-module github.com/tokopedia/gripmock
+module github.com/ringerc/gripmock
 
 go 1.19
 

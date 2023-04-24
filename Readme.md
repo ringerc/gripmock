@@ -70,19 +70,38 @@ Cleanups:
 First, prepare your `.proto` file. Or you can use `hello.proto` in
 `example/simple/` folder.
 
-It is recommended that you use the gripmock docker container image, as it's significantly easier to run.
-
-basic syntax to run GripMock is
-
-`gripmock <protofile>`
+It is recommended that you use the gripmock docker container image, as it's
+significantly easier to run. This fork doesn't currently publish a pre-built
+image, but it's trivial to build one:
 
 - Install [Docker](https://docs.docker.com/install/)
-- Run `docker pull tkpd/gripmock` to pull the image
-- We are gonna mount `/mypath/hello.proto` (it must be a fullpath) into a container and also we expose ports needed. Run `docker run -p 4770:4770 -p 4771:4771 -v /mypath:/proto tkpd/gripmock /proto/hello.proto`
-- On a separate terminal we are gonna add a stub into the stub service. Run `curl -X POST -d '{"service":"Gripmock","method":"SayHello","input":{"equals":{"name":"gripmock"}},"output":{"data":{"message":"Hello GripMock"}}}' localhost:4771/add `
-- Now we are ready to test it with our client. You can find a client example file under `example/simple/client/`. Execute one of your preferred language. Example for go: `go run example/simple/client/*.go`
 
-Check [`example`](https://github.com/tokopedia/gripmock/tree/master/example) folder for various usecase of gripmock.
+- Clone this repo: `git clone github.com/ringerc/gripmock`
+
+- Build the image: `cd gripmock && docker buildx build -t gripmock .`
+
+- Run the `gripmock` image with your protocol files bind-mounted into the
+  container by fully qualified path, and with ports exposed for access. We'll
+  use the `example/simple.proto` protocol from the gripmock repo, specified by
+  full path:
+
+      docker run -p 4770:4770 -p 4771:4771 -v ${PWD}/example/simple:/proto gripmock /proto/simple.proto
+
+- On a separate terminal add a stub into the stub service. Run:
+
+      curl -X POST -d '{"service":"Gripmock","method":"SayHello","input":{"equals":{"name":"gripmock"}},"output":{"data":{"message":"Hello GripMock"}}}' localhost:4771/add
+
+  You'll usually want to use stub files instead, but this is handy for a demo.
+
+- Now we are ready to test it. The simplest way is to install
+  [grpcurl](https://github.com/fullstorydev/grpcurl) then call the endpoint
+  with:
+
+      grpcurl -plaintext -format json -d '{"name":"gripmock"}' localhost:4770 simple.Gripmock/SayHello
+
+Check [`example`](https://github.com/ringerc/gripmock/tree/master/example)
+folder for various usecase of gripmock (all from the original project) and
+some example clients.
 
 ---
 
@@ -116,8 +135,8 @@ go install -v google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
 Then in the `gripmock` dir, install both `gripmock` and its protogen plugin:
 
 ```bash
-go install .
-go install ./protoc-gen-gripmock
+(cd gripmock && go install .)
+(cd protoc-gen-gripmock && go install .)
 ```
 
 

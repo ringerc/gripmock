@@ -1,4 +1,4 @@
-module github.com/tokopedia/gripmock/protoc-gen-gripmock
+module github.com/ringerc/gripmock/protoc-gen-gripmock
 
 go 1.19
 

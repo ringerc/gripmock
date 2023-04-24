@@ -29,7 +29,7 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/tokopedia/gripmock/stub"
+	"github.com/ringerc/gripmock/stub"
 )
 
 const (
