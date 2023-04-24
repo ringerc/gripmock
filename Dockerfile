@@ -4,7 +4,7 @@ RUN mkdir -p /tmp && \
     chmod 1777 /tmp
 
 RUN --mount=type=cache,target=/var/cache/apk \
-  apk -U add git protobuf bash gawk coreutils
+  apk -U add git protobuf
 
 # Download protobuf well-known protocol sources. There must be a better way to
 # fetch the protobuf well-known types than this, but there's no obvious
@@ -91,12 +91,8 @@ USER gripmock
 # available.
 WORKDIR /
 
-# "fix_gopackage.sh" should be moved inside gripmock itself, but for now we
-# need it.
-ADD fix_gopackage.sh /gripmock/bin/fix_gopackage.sh
-
 ENV GOCACHE=
 
 EXPOSE 4770 4771
 
-ENTRYPOINT ["gripmock"]
+ENTRYPOINT ["gripmock","-imports","/protobuf","-o","/generated"]

@@ -22,6 +22,9 @@ Features:
   are set;
   See [Tracing requests and responses with OpenTelemetry](tracing-requests-and-responses-with-opentelemetry)
 
+* Stubs print the services and methods they expose when they start up. This
+  should probably be made optional via a log-level control at some point.
+
 Deprecated code replacement:
 
 * Replace use of [`markbates/pkger`](https://github.com/markbates/pkger)
@@ -36,6 +39,15 @@ Deprecated code replacement:
   file name as comma separated files
 
 Cleanups:
+
+* Remove use of a shell script for munging the protocol files. The `gripmock`
+  binary does the required proto source transformations directly, and
+  `fix_gopackage.sh` has been deleted.
+
+* Simplify logic for generating output protocol go packages. Instead of trying
+  to infer an appropriate package based on working directory, input path prefix
+  and import paths, generate sequential go package names like `proto<n>` for
+  each protocol.
 
 * Generate a `go.mod` along with the server stub `server.go`, and build the
   server with `go build` instead of using a direct `go run`. This makes it
@@ -76,20 +88,38 @@ image, but it's trivial to build one:
 
 - Install [Docker](https://docs.docker.com/install/)
 
-- Clone this repo: `git clone github.com/ringerc/gripmock`
+- Clone this repo: 
 
-- Build the image: `cd gripmock && docker buildx build -t gripmock .`
+      git clone github.com/ringerc/gripmock
+
+- Build the image:
+
+      cd gripmock && docker buildx build -t gripmock .
 
 - Run the `gripmock` image with your protocol files bind-mounted into the
   container by fully qualified path, and with ports exposed for access. We'll
   use the `example/simple.proto` protocol from the gripmock repo, specified by
   full path:
 
-      docker run -p 4770:4770 -p 4771:4771 -v ${PWD}/example/simple:/proto gripmock /proto/simple.proto
+      docker run \
+        -p 4770:4770 -p 4771:4771 \
+        -v ${PWD}/example/simple:/proto \
+	gripmock \
+	/proto/simple.proto
 
 - On a separate terminal add a stub into the stub service. Run:
 
-      curl -X POST -d '{"service":"Gripmock","method":"SayHello","input":{"equals":{"name":"gripmock"}},"output":{"data":{"message":"Hello GripMock"}}}' localhost:4771/add
+      curl -X POST -d '{
+      	"service":"Gripmock",
+	"method":"SayHello",
+	"input":{
+	  "equals":{"name":"gripmock"}
+	},
+	"output":{
+	  "data":{"message":"Hello GripMock"}
+	}
+      }' \
+      localhost:4771/add
 
   You'll usually want to use stub files instead, but this is handy for a demo.
 
@@ -97,7 +127,8 @@ image, but it's trivial to build one:
   [grpcurl](https://github.com/fullstorydev/grpcurl) then call the endpoint
   with:
 
-      grpcurl -plaintext -format json -d '{"name":"gripmock"}' localhost:4770 simple.Gripmock/SayHello
+      grpcurl -plaintext -format json -d '{"name":"gripmock"}' \
+	localhost:4770 simple.Gripmock/SayHello
 
 Check [`example`](https://github.com/ringerc/gripmock/tree/master/example)
 folder for various usecase of gripmock (all from the original project) and
@@ -138,7 +169,6 @@ Then in the `gripmock` dir, install both `gripmock` and its protogen plugin:
 (cd gripmock && go install .)
 (cd protoc-gen-gripmock && go install .)
 ```
-
 
 ## Stubbing
 

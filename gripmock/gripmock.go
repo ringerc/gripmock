@@ -18,7 +18,7 @@ package main
  */
 
 import (
-	"bytes"
+	"bufio"
 	"flag"
 	"fmt"
 	"log"
@@ -26,6 +26,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path"
+	"regexp"
 	"strings"
 	"syscall"
 
@@ -33,8 +34,12 @@ import (
 )
 
 const (
+	// The generated server uses this module name, so it won't clash with
+	// anything that go tools might download from the Internet
 	GENERATED_MODULE_NAME="gripmock/generated"
 )
+
+var protoCounter = 0
 
 func main() {
 	outputPointer := flag.String("o", "generated", "directory to output generated files and binaries. Default is \"generated\"")
@@ -44,7 +49,7 @@ func main() {
 	adminport := flag.String("admin-port", "4771", "Port of stub admin server")
 	adminBindAddr := flag.String("admin-listen", "", "Adress the admin server will bind to. Default to localhost, set to 0.0.0.0 to use from another machine")
 	stubPath := flag.String("stub", "", "Path where the stub files are (Optional)")
-	imports := flag.String("imports", "/protobuf", "comma separated imports path. default path /protobuf is where gripmock Dockerfile install WKT protos")
+	imports := flag.String("imports", "", "comma separated imports path to search for dependency .proto files")
 	// for backwards compatibility
 	if os.Args[1] == "gripmock" {
 		os.Args = append(os.Args[:1], os.Args[2:]...)
@@ -116,10 +121,14 @@ type protocParam struct {
 
 func generateProtoc(param protocParam) {
 	log.Printf("Generating server protocol %s to %s...", param.protoPath, param.output)
-	param.protoPath = fixGoPackage(param.protoPath)
+	var err error
+	param.protoPath, err = fixGoPackages(param.protoPath, param.output)
+	if err != nil {
+		log.Fatalf("Munging proto files: %v", err)
+	}
 
 	args := []string{
-		"-I", "protogen",
+		"-I", param.output,
 	}
 	for _, imp := range param.imports {
 		args = append(args, "-I", imp)
@@ -143,7 +152,7 @@ func generateProtoc(param protocParam) {
 	protoc := exec.Command("protoc", args...)
 	protoc.Stdout = os.Stdout
 	protoc.Stderr = os.Stderr
-	err := protoc.Run()
+	err = protoc.Run()
 	if err != nil {
 		log.Fatal("Fail on protoc ", err)
 	}
@@ -151,24 +160,109 @@ func generateProtoc(param protocParam) {
 	log.Print("Generated protocol")
 }
 
+// Generate a go package name for input proto file 'protoPath';
+// return the package name relative to the GENERATED_MODULE_NAME
+// prefix.
+//
+// These package names aren't used to identify the gRPC service,
+// and they can be pretty much whatever we find convenient. Rather
+// than fiddling with trying to deduce path prefixes etc, we'll
+// just generate them as "proto_<n>" using a counter.
+//
+func genProtoPackageName(protoPath string) (string, error) {
+	protoCounter = protoCounter + 1
+	return fmt.Sprintf("proto%d", protoCounter), nil
+}
+
 // Rewrite the .proto file to replace any go_package directive with one based
-// on our local package path for generated servers, GENERATED_MODULE_NAME
+// on our local package path for generated servers, GENERATED_MODULE_NAME .
+// Write the new file to the provided path.
 //
-// Currently delegated to a hacky shell script
-//
-func fixGoPackage(protoPaths []string) []string {
-	fixgopackage := exec.Command("fix_gopackage.sh", protoPaths...)
-	fixgopackage.Env = append(fixgopackage.Environ(),
-		"GENERATED_MODULE_NAME="+GENERATED_MODULE_NAME)
-	buf := &bytes.Buffer{}
-	fixgopackage.Stdout = buf
-	fixgopackage.Stderr = os.Stderr
-	err := fixgopackage.Run()
+func fixGoPackage(protoPath string, newpackage string, outPath string) error {
+	in, err := os.Open(protoPath)
 	if err != nil {
-		log.Fatal("error on fixGoPackage", err)
+		return err
+	}
+	defer in.Close()
+	s := bufio.NewScanner(in)
+	s.Split(bufio.ScanLines)
+
+	of, err := os.OpenFile(outPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+			return err
+	}
+	defer of.Close()
+	ow := bufio.NewWriter(of)
+
+	foundSyntaxLine := false
+	var matched bool
+	for s.Scan() {
+		l := s.Text()
+
+		// Any go_package line must be omitted, since we'll be writing a
+		// replacement for it.
+		if matched, err = regexp.MatchString("^option[ \\t]+go_package[ \\t]+=", l); err != nil {
+			return err
+		}
+		if matched {
+			continue
+		}
+
+		if matched, err = regexp.MatchString("^syntax[ \\t]", l); err != nil {
+			return err
+		}
+		if matched {
+			if foundSyntaxLine {
+				return fmt.Errorf("Found more than one \"syntax\" statement in \"%s\"", protoPath)
+			}
+			foundSyntaxLine = true;
+			// Immediately after the "syntax" line, add our own option
+			// go_package line to override the protocol's real package
+			// with one we will generate
+			l = l + fmt.Sprintf("\noption go_package = \"%s\";\n", newpackage)
+		}
+
+		// Write (possibly modified) line(s) to the new proto file
+		if _, err := ow.WriteString(l + "\n"); err != nil {
+			return err
+		}
+	}
+	if err := ow.Flush(); err != nil {
+		return err
+	}
+	if err := s.Err(); err != nil {
+		return err
 	}
 
-	return strings.Split(strings.TrimRight(buf.String(), "\n"), "\n")
+	if ! foundSyntaxLine {
+		return fmt.Errorf("Failed to munge protocol file %s: no \"syntax\" line found when scanning file", protoPath)
+	}
+
+	return nil
+}
+
+func fixGoPackages(protoPaths []string, output string) ([]string, error) {
+	outProtos := make([]string, len(protoPaths))
+	for i, proto := range protoPaths {
+		newPackageSuffix, err := genProtoPackageName(proto)
+		if err != nil {
+			return []string{}, err
+		}
+		outProtoDir := path.Join(output, newPackageSuffix)
+		if err := os.MkdirAll(outProtoDir, os.ModePerm); err != nil {
+			return []string{}, err
+		}
+		outProto := path.Join(outProtoDir, path.Base(proto))
+		// Write a copy of the .proto file in outProto with the go_package
+		// directive rewritten to point to the full package path, and the file
+		// placed in in newPackageSuffix/{filename}.proto
+		newPackage := path.Join(GENERATED_MODULE_NAME, newPackageSuffix)
+		if err := fixGoPackage(proto, newPackage, outProto); err != nil {
+			return []string{}, err
+		}
+		outProtos[i] = outProto
+	}
+	return outProtos, nil
 }
 
 func runGrpcServer(output string) (*exec.Cmd, <-chan error) {
@@ -226,3 +320,5 @@ func buildServer(output string) {
 	}
 	log.Print("Built ", path.Join(output,"server"))
 }
+
+// vim: sw=4 ts=4 noet ai
