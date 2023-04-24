@@ -92,6 +92,7 @@ USER gripmock
 WORKDIR /
 
 ENV GOCACHE=
+ENV OTEL_PROPAGATORS=tracecontext,baggage,b3,b3multi
 
 EXPOSE 4770 4771
 

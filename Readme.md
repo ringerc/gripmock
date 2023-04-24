@@ -25,6 +25,8 @@ Features:
 * Stubs print the services and methods they expose when they start up. This
   should probably be made optional via a log-level control at some point.
 
+* Option for verbose logging
+
 Deprecated code replacement:
 
 * Replace use of [`markbates/pkger`](https://github.com/markbates/pkger)
@@ -44,10 +46,8 @@ Cleanups:
   binary does the required proto source transformations directly, and
   `fix_gopackage.sh` has been deleted.
 
-* Simplify logic for generating output protocol go packages. Instead of trying
-  to infer an appropriate package based on working directory, input path prefix
-  and import paths, generate sequential go package names like `proto<n>` for
-  each protocol.
+* Document the protocol path discovery logic and add checks to ensure
+  the files really exist.
 
 * Generate a `go.mod` along with the server stub `server.go`, and build the
   server with `go build` instead of using a direct `go run`. This makes it
@@ -104,20 +104,20 @@ image, but it's trivial to build one:
       docker run \
         -p 4770:4770 -p 4771:4771 \
         -v ${PWD}/example/simple:/proto \
-	gripmock \
-	/proto/simple.proto
+        gripmock \
+        /proto/simple.proto
 
 - On a separate terminal add a stub into the stub service. Run:
 
       curl -X POST -d '{
-      	"service":"Gripmock",
-	"method":"SayHello",
-	"input":{
-	  "equals":{"name":"gripmock"}
-	},
-	"output":{
-	  "data":{"message":"Hello GripMock"}
-	}
+              "service":"Gripmock",
+        "method":"SayHello",
+        "input":{
+          "equals":{"name":"gripmock"}
+        },
+        "output":{
+          "data":{"message":"Hello GripMock"}
+        }
       }' \
       localhost:4771/add
 
@@ -128,7 +128,7 @@ image, but it's trivial to build one:
   with:
 
       grpcurl -plaintext -format json -d '{"name":"gripmock"}' \
-	localhost:4770 simple.Gripmock/SayHello
+        localhost:4770 simple.Gripmock/SayHello
 
 Check [`example`](https://github.com/ringerc/gripmock/tree/master/example)
 folder for various usecase of gripmock (all from the original project) and
@@ -169,6 +169,109 @@ Then in the `gripmock` dir, install both `gripmock` and its protogen plugin:
 (cd gripmock && go install .)
 (cd protoc-gen-gripmock && go install .)
 ```
+
+## Protocol paths
+
+`gripmock` itself does not check and resolve imports between protocol files. It
+just preserves the protocol paths of each input protocol relative to the
+matching import path directory when it generates its own modified protocol
+files. So if you get your import paths wrong, `protoc` will complain about
+resolving imports relative to the gripmock output directory.
+
+Using [`example/multi-package`](./example/multi-package)
+from the gripmock source as an example:
+
+        example/multi-package
+                    ├── bar
+                    │   └── bar.proto
+                    ├── client
+                    ├── foo.proto
+                    ├── hello.proto
+                    └── stub
+
+You will note that [`hello.proto`](example/multi-package/hello.proto)'s `import` directives are
+relative to the `example/multi-package` directory:
+
+    import "bar/bar.proto";
+    import "foo.proto";
+
+therefore we must specify the `example/multi-package` directory on the gripmock
+import path.
+
+If we tried to instead supply the `example` directory on the import path,
+`protoc` would be unable to resolve `foo.proto` as `example/foo.proto` and
+would fail.
+
+The following would all be correct container invocations, where
+`example/multi-package` is bound to `/src` within the container:
+
+    # Use absolute paths within container, import path is prefix of proto
+    # paths
+    docker run -v ${PWD}/example/multi-package:/src gripmock \
+        -import /protobuf,/src \
+        /src/foo.proto /src/hello.proto /src/bar/bar.proto
+
+    # Proto paths are relative to absolute import path
+    docker run -v ${PWD}/example/multi-package:/src gripmock \
+        -import /protobuf,/src \
+        foo.proto hello.proto bar/bar.proto
+
+If you want one `gripmock` to serve many protocols, just list each protocol
+directory as an import. Then specify the protocol files relative to the
+protocol directories.
+
+### Gripmock protocol path resolution
+
+If you see an error like
+
+    Protocol file not found on any import path, see README for details
+
+then gripmock was unable to find a containing import directory for one or more
+input `.proto` files on the command line positional arguments list.
+
+Each input `.proto` file MUST be contained within one of the directories on the
+`-imports` argument list. Gripmock searches for protocols within import
+directories using the following algorithm, which resembles that used by
+`protoc` itself:
+
+* If the `.proto` path is relative; then
+  * For each import directory:
+    * Construct a fully qualified proto path relative to the import dir; and
+    * Test whether the file at `{importdir}/{proto_arg}` exists
+* If the `.proto` path is absolute; then
+  * For each import directory:
+    * Convert relative import dir paths to an absolute path resolved against
+      the current working directory; then
+    * Normalize proto path and import path; then
+    * Check whether the import path is a lexical prefix of the import path,
+      and if so, return the proto path with the import path prefix removed
+* If the protocol file is not found in any import path, test whether the
+  protocol path exists (either relative to the gripmock working
+  directory or as an absolute path). If so, use the directory that contains
+  the input `.proto` file as an implicit path entry. The message
+  `WARNING: adding proto file's containing dir as implicit import path` will
+  be emitted in this case. You should use explicit import paths instead,
+  as this will not work correctly if the protocol file imports other protos
+  via relative paths.
+
+Absolute path matching is case sensitive even if the file system is
+case-insensitive. Gripmock will not resolve symbolic links when resolving
+absolute protocol paths.
+
+Mixing absolute and relative paths is supported, but not recommended.
+
+Run `gripmock` with `-verbose 4` to see details on the protocol path search
+process.
+
+### Protocol path shadowed
+
+An error like
+
+    Input is shadowed in the --proto_path
+
+from `protoc` itself indicates a bug in gripmock's protocol path resolution.
+Please raise an issue *with a fully self contained reproducible test case*
+illustrating the problem.
 
 ## Stubbing
 

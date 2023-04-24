@@ -21,14 +21,19 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
-	"log"
 	"os"
+	"io"
 	"os/exec"
 	"os/signal"
+	stdlog "log"
 	"path"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"syscall"
+
+	"github.com/go-logr/logr"
+	"github.com/go-logr/stdr"
 
 	"github.com/ringerc/gripmock/stub"
 )
@@ -37,9 +42,20 @@ const (
 	// The generated server uses this module name, so it won't clash with
 	// anything that go tools might download from the Internet
 	GENERATED_MODULE_NAME="gripmock/generated"
+
+	EXITCODE_OTHER_ERROR = 1
+	EXITCODE_BUILD_ERROR = 2
+	EXITCODE_RUNTIME_ERROR = 3
+	EXITCODE_ARGUMENTS_ERROR = 4
+
+	LOG_ERROR = 0
+	LOG_INFO = 1
+	LOG_VERBOSE = 2
+	LOG_DEBUG = 3
+	LOG_TRACE = 4
 )
 
-var protoCounter = 0
+var log logr.Logger
 
 func main() {
 	outputPointer := flag.String("o", "generated", "directory to output generated files and binaries. Default is \"generated\"")
@@ -50,19 +66,29 @@ func main() {
 	adminBindAddr := flag.String("admin-listen", "", "Adress the admin server will bind to. Default to localhost, set to 0.0.0.0 to use from another machine")
 	stubPath := flag.String("stub", "", "Path where the stub files are (Optional)")
 	imports := flag.String("imports", "", "comma separated imports path to search for dependency .proto files")
+	logVerbosity := flag.Int("verbosity", LOG_INFO, "log verbosity [0..4], default 1")
+
 	// for backwards compatibility
 	if os.Args[1] == "gripmock" {
 		os.Args = append(os.Args[:1], os.Args[2:]...)
 	}
 
 	flag.Parse()
-	fmt.Println("Starting GripMock")
-	output := *outputPointer
 
-	// for safety
-	output += "/"
+	initLogging(*logVerbosity)
+
+	log.V(LOG_VERBOSE).Info("Starting GripMock")
+
+	output := *outputPointer
+	if output == "" {
+		log.V(LOG_ERROR).Info("output dir may not be empty")
+		os.Exit(EXITCODE_ARGUMENTS_ERROR)
+	}
 	if _, err := os.Stat(output); os.IsNotExist(err) {
-		os.Mkdir(output, os.ModePerm)
+		if err := os.Mkdir(output, os.ModePerm); err != nil {
+			log.Error(err, "creating output directory", "dir", output)
+			os.Exit(EXITCODE_OTHER_ERROR)
+		}
 	}
 
 	// run admin stub server
@@ -76,13 +102,14 @@ func main() {
 	protoPaths := flag.Args()
 
 	if len(protoPaths) == 0 {
-		log.Fatal("Need at least one proto file")
+		log.V(LOG_ERROR).Info("Need at least one proto file")
+		os.Exit(EXITCODE_ARGUMENTS_ERROR)
 	}
 
 	importDirs := strings.Split(*imports, ",")
 
 	// generate pb.go and grpc server based on proto
-	generateProtoc(protocParam{
+	if err := generateProtoc(protocParam{
 		protoPath:   protoPaths,
 		adminPort:   *adminport,
 		grpcAddress: *grpcBindAddr,
@@ -90,23 +117,49 @@ func main() {
 		output:      output,
 		imports:     importDirs,
 		templateDir:    *templateDir,
-	})
+	}); err != nil {
+		log.Error(err, "when generating protocol and server")
+		os.Exit(EXITCODE_BUILD_ERROR)
+	}
 
 	// Build the server binary
-	buildServer(output)
+	if err := buildServer(output); err != nil {
+		log.Error(err, "building gRPC server")
+		os.Exit(EXITCODE_BUILD_ERROR)
+	}
 
 	// and run
-	run, runerr := runGrpcServer(output)
+	run, runerrchan := runGrpcServer(output)
 
-	var term = make(chan os.Signal)
-	signal.Notify(term, syscall.SIGTERM, syscall.SIGKILL, syscall.SIGINT)
-	select {
-	case err := <-runerr:
-		log.Fatal(err)
-	case <-term:
-		fmt.Println("Stopping gRPC Server")
-		run.Process.Kill()
+	var sigchan = make(chan os.Signal)
+	signal.Notify(sigchan, syscall.SIGTERM, syscall.SIGINT)
+	for {
+		select {
+		case err := <-runerrchan:
+			switch e := err.(type) {
+			case *exec.ExitError:
+				log.V(LOG_INFO).Info("gRPC server exited", "exitcode", e.ExitCode())
+				if e.Success() {
+					os.Exit(0)
+				} else {
+					os.Exit(EXITCODE_RUNTIME_ERROR)
+				}
+			default:
+				log.V(LOG_INFO).Error(e, "gRPC server exited", "error")
+			}
+		case <-sigchan:
+			log.V(LOG_DEBUG).Info("Caught signal, stopping gRPC Server")
+			run.Process.Kill()
+			// Now wait for child exit
+		}
 	}
+
+	panic("unreachable")
+}
+
+func initLogging(level int) {
+	log = stdr.New(stdlog.New(os.Stdout, "", 0))
+	stdr.SetVerbosity(level)
 }
 
 type protocParam struct {
@@ -119,17 +172,20 @@ type protocParam struct {
 	templateDir string
 }
 
-func generateProtoc(param protocParam) {
-	log.Printf("Generating server protocol %s to %s...", param.protoPath, param.output)
-	var err error
-	param.protoPath, err = fixGoPackages(param.protoPath, param.output)
-	if err != nil {
-		log.Fatalf("Munging proto files: %v", err)
+func generateProtoc(param protocParam) error {
+	log.V(LOG_VERBOSE).Info("Generating server protocol", "input", param.protoPath, "output", param.output)
+
+	// Generate new .proto files under param.output and update param.protoPath
+	// and param.imports to point to them instead of the original user inputs
+	if err := fixGoPackages(&param); err != nil {
+		return fmt.Errorf("Munging proto files: %w", err)
 	}
 
-	args := []string{
-		"-I", param.output,
-	}
+	// Always search the generated protos dir first, since that will ensure
+	// any proto files we rewrote with new package names will appear before
+	// any of the well-known types and other protos our proto files may
+	// have imported but do not serve.
+	args := []string{"-I", param.output}
 	for _, imp := range param.imports {
 		args = append(args, "-I", imp)
 	}
@@ -148,52 +204,156 @@ func generateProtoc(param protocParam) {
 		"--gripmock_opt=grpc-port="+param.grpcPort,
 		"--gripmock_opt=template-dir="+param.templateDir,
 	)
-	log.Printf("invoking \"protoc\" with args %v", args)
 	protoc := exec.Command("protoc", args...)
 	protoc.Stdout = os.Stdout
 	protoc.Stderr = os.Stderr
-	err = protoc.Run()
-	if err != nil {
-		log.Fatal("Fail on protoc ", err)
+	log.V(LOG_VERBOSE).Info("invoking \"protoc\"", "cmd", protoc.String())
+	if err := protoc.Run(); err != nil {
+		return fmt.Errorf("running protoc: %w", err)
 	}
 
-	log.Print("Generated protocol")
+	log.V(LOG_VERBOSE).Info("Generated protocol and server")
+
+	return nil
 }
 
 // Generate a go package name for input proto file 'protoPath';
 // return the package name relative to the GENERATED_MODULE_NAME
 // prefix.
 //
-// These package names aren't used to identify the gRPC service,
-// and they can be pretty much whatever we find convenient. Rather
-// than fiddling with trying to deduce path prefixes etc, we'll
-// just generate them as "proto_<n>" using a counter.
+// Returns: import path protocol matched on, protocol path relative to import dir
 //
-func genProtoPackageName(protoPath string) (string, error) {
-	protoCounter = protoCounter + 1
-	return fmt.Sprintf("proto%d", protoCounter), nil
+// The go package could be anything unique. But protoc imports
+// expect to find the proto files relative to the import path,
+// so we're going to need to preserve that in the output.
+//
+func findProtoInImports(importPaths []string, protoPath string) (string, string, error) {
+	// Search the original source import path(s) for the proto file(s)
+	// requested. Returns the import path the proto is within and the relative
+	// path to the proto file's containing dir within that import path.
+	// 
+	// If the proto is a relative path, search for that relative path under
+	// each import and return it if found.
+	//
+	log.V(LOG_TRACE).Info("Searching import paths for protocol file", "proto", protoPath, "importPaths", importPaths)
+	if protoPath == "" {
+		return "", "", fmt.Errorf("empty input")
+	}
+	protoPath = filepath.Clean(protoPath)
+	var matchedImp string
+	var matchedRel string
+	for _, imp := range importPaths {
+		imp = filepath.Clean(imp)
+		log.V(LOG_TRACE).Info("checking import", "dir", imp, "proto", protoPath)
+
+		if filepath.IsAbs(protoPath) {
+			// If the proto is an absolute path, check if any import has that
+			// prefix, and return the remainder of the path. This isn't a very
+			// smart operation; it will fall over on case-insensitive file
+			// systems, and it doesn't try to resolve symlinks. Any relative
+			// import paths are made relative to the gripmock CWD.
+			//
+			// Relative import paths are converted to absolute paths using the
+			// gripmock working directory as a base.
+			//
+			absImp, err := filepath.Abs(imp)
+			if err != nil {
+				return "", "", fmt.Errorf("making path %s absolute: %w", imp, err)
+			}
+			log.V(LOG_TRACE).Info("testing path containment", "containerPath", absImp, "containedPath", protoPath)
+			relPath, err := filepath.Rel(absImp, protoPath)
+			// We have to exclude relative paths that descend because filepath.Rel
+			// will generate a descending relative path if given two absolute paths
+			if err == nil && relPath != "" && !strings.HasPrefix(relPath, "../") {
+				log.V(LOG_TRACE).Info("matched absolute path prefix", "proto", protoPath, "dir", imp, "absdir", absImp, "rel", relPath)
+
+				rel := path.Dir(relPath)
+				// Sanity check that the proto file is actually on the matched
+				// import path, since filepath.Rel is just a lexical check.
+				derivedPath := path.Join(imp, rel, path.Base(protoPath))
+				if _, err := os.Stat(derivedPath); err != nil {
+					log.V(LOG_TRACE).Info("protocol file appears to be within import path, but could not stat() file",
+										 "derived proto path to stat", derivedPath, "error", err)
+					// We'll keep searching later import dirs, this
+					// one didn't contain the file
+				} else {
+					// Proto file exists in this import dir. Return the import path and
+					// the proto path relative to the import path.
+					matchedImp = imp
+					matchedRel = rel
+					log.V(LOG_TRACE).Info("found abs path protocol file",
+										   "derived path", derivedPath,
+									       "import", matchedImp,
+									       "relpath", matchedRel)
+					break;
+				}
+			}
+		} else {
+			// The proto is a relative path. Search each import directory for
+			// it, and if the proto file exists, return the path to the proto
+			// file's directory relative to the matching import dir. It's
+			// irrelevant whether the import path is relative or absolute for
+			// this. We don't recurse inside the directories, we only care about
+			// whether the proto path can be found within the top level importdir.
+			importProtoPath := path.Join(imp, protoPath)
+			log.V(LOG_TRACE).Info("testing path existence", "path", importProtoPath)
+			if _, err := os.Stat(importProtoPath); !os.IsNotExist(err) {
+				matchedImp = imp
+				matchedRel = path.Dir(protoPath)
+				log.V(LOG_TRACE).Info("matched relative path", "proto", protoPath, "dir", imp, "fullPath", importProtoPath)
+				break
+			}
+		}
+	}
+
+	if matchedRel == "" && matchedImp == "" {
+		// If the proto path exist (rel or abs) but isn't in the import path,
+		// we'll add its full path as an implicit import path entry. This isn't
+		// recommended, but was the previous gripmock behaviour, so is retained
+		// for BC. It won't work correctly if the proto imports any other protos
+		// and isn't itself in the "base" directory of its proto tree; protoc
+		// will fail to find its imports.
+		if _, err := os.Stat(protoPath); !os.IsNotExist(err) {
+			if ! filepath.IsAbs(protoPath) {
+				wd, _ := os.Getwd()
+				log.V(LOG_VERBOSE).Info(fmt.Sprintf("Protocol file \"%s\" not found on any import path, but WAS found relative to the gripmock working directory \"%s\".", protoPath, wd))
+			}
+			matchedImp = path.Dir(protoPath)
+			matchedRel = "."
+			log.V(LOG_INFO).Info("WARNING: adding proto file's containing dir as implicit import path. You should specify an appropriate path on the -imports list instead.", "importpath", matchedImp)
+		} else {
+			log.V(LOG_INFO).Info("Protocol file not found on any import path, see README for details") 
+			return "", "", fmt.Errorf("could not find proto \"%s\" on import path", protoPath)
+		}
+
+	}
+
+	// Sanity check that the proto file is actually on the matched import path
+	derivedPath := path.Join(matchedImp, matchedRel, path.Base(protoPath))
+	fileinfo, err := os.Stat(derivedPath)
+	if err != nil {
+		return "", "", fmt.Errorf("cannot stat proto file at path \"%s\": %w", derivedPath, err)
+	}
+	if fileinfo.IsDir() {
+		return "", "", fmt.Errorf("path \"%s\" is a directory", derivedPath)
+	}
+
+	return matchedImp, matchedRel, nil
 }
 
-// Rewrite the .proto file to replace any go_package directive with one based
-// on our local package path for generated servers, GENERATED_MODULE_NAME .
-// Write the new file to the provided path.
-//
-func fixGoPackage(protoPath string, newpackage string, outPath string) error {
-	in, err := os.Open(protoPath)
-	if err != nil {
-		return err
+// Stream transformation that rewrites a .proto file's go_package directive
+// to point to new_package
+func fixGoPackageProtoStream(in io.Reader, newPackage string, out io.Writer) error {
+	if newPackage == "" {
+		return fmt.Errorf("empty package name")
 	}
-	defer in.Close()
+
 	s := bufio.NewScanner(in)
 	s.Split(bufio.ScanLines)
 
-	of, err := os.OpenFile(outPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
-	if err != nil {
-			return err
-	}
-	defer of.Close()
-	ow := bufio.NewWriter(of)
+	ow := bufio.NewWriter(out)
 
+	var err error
 	foundSyntaxLine := false
 	var matched bool
 	for s.Scan() {
@@ -213,13 +373,13 @@ func fixGoPackage(protoPath string, newpackage string, outPath string) error {
 		}
 		if matched {
 			if foundSyntaxLine {
-				return fmt.Errorf("Found more than one \"syntax\" statement in \"%s\"", protoPath)
+				return fmt.Errorf("Found more than one \"syntax\" statement")
 			}
 			foundSyntaxLine = true;
 			// Immediately after the "syntax" line, add our own option
 			// go_package line to override the protocol's real package
 			// with one we will generate
-			l = l + fmt.Sprintf("\noption go_package = \"%s\";\n", newpackage)
+			l = l + fmt.Sprintf("\noption go_package = \"%s\";\n", newPackage)
 		}
 
 		// Write (possibly modified) line(s) to the new proto file
@@ -227,6 +387,7 @@ func fixGoPackage(protoPath string, newpackage string, outPath string) error {
 			return err
 		}
 	}
+
 	if err := ow.Flush(); err != nil {
 		return err
 	}
@@ -235,34 +396,88 @@ func fixGoPackage(protoPath string, newpackage string, outPath string) error {
 	}
 
 	if ! foundSyntaxLine {
-		return fmt.Errorf("Failed to munge protocol file %s: no \"syntax\" line found when scanning file", protoPath)
+		return fmt.Errorf("no \"syntax\" line found when scanning proto file")
 	}
 
 	return nil
 }
 
-func fixGoPackages(protoPaths []string, output string) ([]string, error) {
-	outProtos := make([]string, len(protoPaths))
-	for i, proto := range protoPaths {
-		newPackageSuffix, err := genProtoPackageName(proto)
+// Rewrite the .proto file to replace any go_package directive with one based
+// on our local package path for generated servers, GENERATED_MODULE_NAME .
+// Write the new file to the provided path.
+//
+func fixGoPackage(protoPath string, newPackage string, outPath string) error {
+	in, err := os.Open(protoPath)
+	if err != nil {
+		return fmt.Errorf("opening input proto file for reading: %w", err)
+	}
+	defer in.Close()
+
+	of, err := os.OpenFile(outPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return fmt.Errorf("opening output proto file for writing: %w", err)
+	}
+	defer of.Close()
+
+	if err := fixGoPackageProtoStream(in, newPackage, of); err != nil {
+		return fmt.Errorf("failed to munge proto file \"%s\": %w", protoPath, err)
+	}
+	log.V(LOG_DEBUG).Info("wrote modified proto file",
+						   "original", protoPath,
+						   "new package name", newPackage,
+						   "output", outPath)
+	return nil
+}
+
+// Make copies of the input protocol file(s) into the gripmock output
+// directory, with each protocol file modified so that its go package is
+// rewritten to a custom package.
+//
+// Returns list of resolved .proto file paths.
+//
+// The resulting proto files must have the same relative path to the output dir
+// as the corresponding input did to the protoc import path that contained it.
+// This is needed because protoc imports are resolved as paths relative to the
+// protoc import path list and we don't want to have to rewrite import paths in
+// the protocols we process.
+//
+func fixGoPackages(param *protocParam) error {
+	outProtos := make([]string, len(param.protoPath))
+	for i, proto := range param.protoPath {
+		importDir, newPackageSuffix, err := findProtoInImports(param.imports, proto)
 		if err != nil {
-			return []string{}, err
+			return err
 		}
-		outProtoDir := path.Join(output, newPackageSuffix)
-		if err := os.MkdirAll(outProtoDir, os.ModePerm); err != nil {
-			return []string{}, err
-		}
+		protoPath := path.Join(importDir, newPackageSuffix, path.Base(proto))
+		outProtoDir := path.Join(param.output, newPackageSuffix)
 		outProto := path.Join(outProtoDir, path.Base(proto))
 		// Write a copy of the .proto file in outProto with the go_package
 		// directive rewritten to point to the full package path, and the file
 		// placed in in newPackageSuffix/{filename}.proto
 		newPackage := path.Join(GENERATED_MODULE_NAME, newPackageSuffix)
-		if err := fixGoPackage(proto, newPackage, outProto); err != nil {
-			return []string{}, err
+		log.V(LOG_TRACE).Info("path resolution",
+							  "input proto arg", proto,
+							  "resolved input proto path", protoPath,
+							  "import dir", importDir,
+							  "package suffix", newPackageSuffix,
+							  "output proto dir", outProtoDir,
+							  "output proto file", outProto,
+							  "full proto package", newPackage)
+		if err := os.MkdirAll(outProtoDir, os.ModePerm); err != nil {
+			return err
+		}
+		// Write a copy of the original proto in the output dir, preserving the
+		// same path-prefix. Change the go_package directive to the new one for
+		// locally generated proto files.
+		if err := fixGoPackage(protoPath, newPackage, outProto); err != nil {
+			return err
 		}
 		outProtos[i] = outProto
 	}
-	return outProtos, nil
+	// Modify the protoc inputs to use our munged protocol files,
+	// all of which are within the outputdir
+	param.protoPath = outProtos
+	return nil
 }
 
 func runGrpcServer(output string) (*exec.Cmd, <-chan error) {
@@ -271,9 +486,10 @@ func runGrpcServer(output string) (*exec.Cmd, <-chan error) {
 	run.Stderr = os.Stderr
 	err := run.Start()
 	if err != nil {
-		log.Fatal(err)
+		log.Error(err, "starting grpc server")
+		os.Exit(EXITCODE_RUNTIME_ERROR)
 	}
-	fmt.Printf("grpc server pid: %d\n", run.Process.Pid)
+	log.V(LOG_VERBOSE).Info("grpc server started", "pid", run.Process.Pid)
 	runerr := make(chan error)
 	go func() {
 		runerr <- run.Wait()
@@ -281,44 +497,46 @@ func runGrpcServer(output string) (*exec.Cmd, <-chan error) {
 	return run, runerr
 }
 
-func buildServer(output string) {
-	log.Print("Building server...")
+func buildServer(output string) error {
+	log.V(LOG_VERBOSE).Info("Building server")
 	oldCwd, err := os.Getwd()
 	if err != nil {
-		log.Fatal(err)
+		return fmt.Errorf("getcwd(): %w", err)
 	}
 	if err := os.Chdir(output); err != nil {
-		log.Fatal(err)
+		return fmt.Errorf("changing directory to %s: %w", output, err)
 	}
 
-	log.Printf("setting module name")
 	run := exec.Command("go", "mod", "edit", "-module", GENERATED_MODULE_NAME)
 	run.Stdout = os.Stdout
 	run.Stderr = os.Stderr
+	log.V(LOG_DEBUG).Info("setting go.mod module name", "cmd", run.String())
 	if err := run.Run(); err != nil {
-		log.Fatal("go mod edit: ", err)
+		return fmt.Errorf("setting go.mod name: %w", err)
 	}
 
-	log.Printf("go mod tidy")
 	run = exec.Command("go", "mod", "tidy")
 	run.Stdout = os.Stdout
 	run.Stderr = os.Stderr
+	log.V(LOG_DEBUG).Info("tidying go.mod", "cmd", run.String())
 	if err := run.Run(); err != nil {
-		log.Fatal("go mod tidy: ", err)
+		return fmt.Errorf("tidying go.mod: %w", err)
 	}
 
-	log.Printf("go build")
-	run = exec.Command("go", "build", "-o", "server", ".")
+	run = exec.Command("go", "build", "-o", "server", "./cmd/...")
 	run.Stdout = os.Stdout
 	run.Stderr = os.Stderr
+	log.V(LOG_DEBUG).Info("building gRPC server from module", "cmd", run.String())
 	if err := run.Run(); err != nil {
-		log.Fatal("go build -o server .: ", err)
+		return fmt.Errorf("building server: %w", err)
 	}
 
 	if err := os.Chdir(oldCwd); err != nil {
-		log.Fatal(err)
+		return fmt.Errorf("returning to old working directory: %w", err)
 	}
-	log.Print("Built ", path.Join(output,"server"))
+	log.Info("Built server", "path", path.Join(output,"server"))
+
+	return nil
 }
 
 // vim: sw=4 ts=4 noet ai

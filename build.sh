@@ -11,4 +11,4 @@ go mod vendor
 rm -rf protogen
 mkdir -p protogen 
 
-docker buildx build --progress=plain -t "tkpd/gripmock:$1" .
+docker buildx build --progress=plain -t "ringerc/gripmock:$1" .

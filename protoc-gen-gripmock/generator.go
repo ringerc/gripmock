@@ -200,7 +200,7 @@ func generateServer(fw FileWriter, protos []*descriptorpb.FileDescriptorProto, o
 		AdminPort:    opt.adminPort,
 	}
 
-	if err := generateFile(fw, opt, templateParams, "server.tmpl", "server.go", true); err != nil {
+	if err := generateFile(fw, opt, templateParams, "server.tmpl", "cmd/server.go", true); err != nil {
 		return err
 	}
 
