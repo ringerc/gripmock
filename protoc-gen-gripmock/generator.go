@@ -68,7 +68,7 @@ func main() {
 	err = generateServer(fw, protos, &generateOptions)
 
 	if err != nil {
-		log.Fatalf("Failed to generate server %v", err)
+		log.Fatalf("Failed to generate server: %v", err)
 	}
 
 	// Generate a response from our plugin and marshall as protobuf
@@ -192,9 +192,6 @@ func generateServer(fw FileWriter, protos []*descriptorpb.FileDescriptorProto, o
 	if opt == nil {
 		opt = &Options{}
 	}
-	if opt.templateDir == "" {
-		opt.templateDir = "."
-	}
 
 	templateParams := generatorParam{
 		Services:     services,
@@ -203,11 +200,11 @@ func generateServer(fw FileWriter, protos []*descriptorpb.FileDescriptorProto, o
 		AdminPort:    opt.adminPort,
 	}
 
-	if err := generateFile(fw, opt, templateParams, "server.tmpl", "server.go"); err != nil {
+	if err := generateFile(fw, opt, templateParams, "server.tmpl", "server.go", true); err != nil {
 		return err
 	}
 
-	if err := generateFile(fw, opt, templateParams, "go_mod.tmpl", "go.mod"); err != nil {
+	if err := generateFile(fw, opt, templateParams, "go_mod.tmpl", "go.mod", false); err != nil {
 		return err
 	}
 
@@ -217,7 +214,7 @@ func generateServer(fw FileWriter, protos []*descriptorpb.FileDescriptorProto, o
 /*
  * Load, template, and write one file from the server template.
  */
-func generateFile(fw FileWriter, opt *Options, templateParams generatorParam, templateFileName string, outFileName string) error {
+func generateFile(fw FileWriter, opt *Options, templateParams generatorParam, templateFileName string, outFileName string, formatGo bool) error {
 
 	templateFile, err := readTemplate(opt.templateDir, templateFileName)
 	if err != nil {
@@ -235,14 +232,17 @@ func generateFile(fw FileWriter, opt *Options, templateParams generatorParam, te
 	if err != nil {
 		return fmt.Errorf("template execute %v", err)
 	}
-
 	byt := buf.Bytes()
-	bytProcessed, err := imports.Process("", byt, nil)
-	if err != nil {
-		return fmt.Errorf("formatting: %v \n%s", err, string(byt))
+
+	if formatGo {
+		bytProcessed, err := imports.Process("", byt, nil)
+		if err != nil {
+			return fmt.Errorf("formatting imports: %v \n%s", err, string(byt))
+		}
+		byt = bytProcessed
 	}
 
-	if err := fw.AddGeneratedFile(outFileName, ".", bytProcessed); err != nil {
+	if err := fw.AddGeneratedFile(outFileName, ".", byt); err != nil {
 		return err
 	}
 

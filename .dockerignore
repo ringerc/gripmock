@@ -2,6 +2,8 @@
 /assets
 /protobuf
 /Readme.md
-/gripmock
+/gripmock/gripmock
 /protoc-gen-gripmock/protoc-gen-gripmock
+/gripmock/vendor
+/protoc-gen-gripmock/vendor
 /generated

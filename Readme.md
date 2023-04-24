@@ -5,21 +5,75 @@ The server implementation is in GoLang but the client can be any programming lan
 
 ---
 
-### Announcement:
-The latest [version (v1.10)](https://github.com/tokopedia/gripmock/releases/tag/v1.10) of gripmock is requiring `go_package` declaration in the `.proto` file. This is due to the latest update of `protoc` plugin that being used by gripmock is making the `go_package` declaration mandatory.
+**This is a fork of the
+[original Gripmock upstream](https://github.com/tokopedia/gripmock/)**
+with the following changes:
 
-**Update Feb 2022:**
+Features:
 
-[Version 1.11-beta](https://github.com/tokopedia/gripmock/releases/tag/v1.11-beta) release is available.
-It supports **NO** declaration of `go_package`, please download and test before it can be tagged as stable.
+* Support proto3 "optional"
 
-you can get the docker image using `docker pull tkpd/gripmock:v1.11-beta`.
+* Support overriding the default server template using a `-template-dir` option
+  to provide an alternate directory for the `server.tmpl` and `go_mod.tmpl`
+  files.
+
+* Read OpenTelemetry trace metadata in W3C trace context or Zipkin b3 (single
+  or multi) formats and emit trace spans to a trace collector if appropriate env-vars
+  are set;
+  See [Tracing requests and responses with OpenTelemetry](tracing-requests-and-responses-with-opentelemetry)
+
+Deprecated code replacement:
+
+* Replace use of [`markbates/pkger`](https://github.com/markbates/pkger)
+  with native `go:embed` use.
+
+* Replace deprecated `https://github.com/google/protobuf` with
+  `google.golang.org/protobuf` and adapt plugin interface accordingly.
+
+* Update to go 1.19
+
+* Pass plugin options as separate generator options, not embedded into input
+  file name as comma separated files
+
+Cleanups:
+
+* Generate a `go.mod` along with the server stub `server.go`, and build the
+  server with `go build` instead of using a direct `go run`. This makes it
+  easier to ensure that expected modules and versions are present, override
+  modules, etc.
+
+* Use a module name for generated code that is not under the gripmock github
+  repo. This ensures that the build will use generated protocols. If they're
+  not found locally then attempts to download them from the Internet will fail
+  visibly.
+
+* Cache build dependencies for the generated servers in the `Dockerfile`
+  so that most runs of the container image don't need to make any network
+  requests.
+
+* Move gripmock into a subdir so the components don't share a module
+
+* Do not write inside `$GOPATH`; build clean and self contained server stubs
+  where the `/go` path is read-only
+
+* Only copy needed files into the docker image; omit tempfiles, go build caches
+  etc from the final image
+
+* Use Docker Buildkit cache for image builds when available so that repeat
+  builds on one machine are faster and don't repeat downloads even if the
+  dockerfile layer cache is invalidated
 
 ---
 
 ## Quick Usage
-First, prepare your `.proto` file. Or you can use `hello.proto` in `example/simple/` folder. Suppose you put it in `/mypath/hello.proto`. We are gonna use Docker image for easier example test.
+
+First, prepare your `.proto` file. Or you can use `hello.proto` in
+`example/simple/` folder.
+
+It is recommended that you use the gripmock docker container image, as it's significantly easier to run.
+
 basic syntax to run GripMock is
+
 `gripmock <protofile>`
 
 - Install [Docker](https://docs.docker.com/install/)
@@ -50,7 +104,22 @@ The second binary is the protoc plugin which located in folder [protoc-gen-gripm
 
 ![Inside GripMock](/assets/images/gripmock_readme-inside.png)
 
----
+## Local install
+
+To install and run `gripmock` locally, without using the container image, you will require `protoc-gen-go` and `protoc-gen-go-grpc`:
+
+```bash
+go install -v google.golang.org/protobuf/cmd/protoc-gen-go@latest && \
+go install -v google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+```
+
+Then in the `gripmock` dir, install both `gripmock` and its protogen plugin:
+
+```bash
+go install .
+go install ./protoc-gen-gripmock
+```
+
 
 ## Stubbing
 
@@ -193,7 +262,7 @@ server exposes a reflection interface so you can also use
 
     grpcurl -plaintext localhost:5880 list
 
-## Tracing requests and responses with OpoenTelemetry
+## Tracing requests and responses with OpenTelemetry
 
 Gripmock generates an OpenTelemetry-enabled gRPC server that will send trace
 events to the OpenTelemetry collector, a zipkin server, or write them as json

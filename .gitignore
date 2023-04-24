@@ -1,5 +1,5 @@
 pkged.go
-gripmock
+gripmock/gripmock
 protoc-gen-gripmock/protoc-gen-gripmock
 .idea
 .DS_Store
