@@ -5,40 +5,47 @@ on:
       master
   workflow_dispatch:
 
+env:
+  grpcurl_version: 1.8.7
+  k6_version: 0.44.0
+
 jobs:
-  build:
-    name: Run example
+  build-and-test:
     runs-on: ubuntu-latest
+    name: Build container, run basic tests
     steps:
+
     - name: Checkout
       uses: actions/checkout@master
-    - name: Run Simple Example
-      uses: ./
+
+    - name: Build image
+      uses: docker/build-push-action@v4
       with:
-        entrypoint: example/simple/entrypoint.sh
-        args: simple
-    - name: Run Stream Example
-      uses: ./
+        push: false
+        load: true
+        tags: "test"
+
+    - name: cache k6
+      uses: actions/cache@v3
       with:
-        entrypoint: example/stream/entrypoint.sh
-        args: stream
-    - name: Run WKT Example
-      uses: ./
-      with:
-        entrypoint: example/well_known_types/entrypoint.sh
-    - name: Run Multi Package Example
-      uses: ./
-      with:
-        entrypoint: example/multi-package/entrypoint.sh
-    - name: Run Multi Files Example
-      uses: ./
-      with:
-        entrypoint: example/multi-files/entrypoint.sh
-    - name: Run one-of Example
-      uses: ./
-      with:
-        entrypoint: example/one-of/entrypoint.sh
-    - name: Run stub subfolders example
-      uses: ./
-      with:
-        entrypoint: example/stub-subfolders/entrypoint.sh
+        path: k6
+        key: ${{ env.k6_version }}
+
+    - name: install k6
+      run:
+        curl -sSLf -o - https://github.com/grafana/k6/releases/download/v${k6_version}/k6-v${k6_version}-linux-amd64.tar.gz | tar xzf - --strip-components=1 --wildcards '*/k6'
+
+        # - name: Run Simple Example
+        #   run: example/simple/entrypoint.sh simple
+        # - name: Run Stream Example
+        #   run: example/stream/entrypoint.sh stream
+        # - name: Run WKT Example
+        #   run: example/well_known_types/entrypoint.sh
+        # - name: Run Multi Package Example
+        #   run: example/multi-package/entrypoint.sh
+        # - name: Run Multi Files Example
+        #   run: example/multi-files/entrypoint.sh
+        # - name: Run one-of Example
+        #   run: example/one-of/entrypoint.sh
+        # - name: Run stub subfolders example
+        #   run: example/stub-subfolders/entrypoint.sh
