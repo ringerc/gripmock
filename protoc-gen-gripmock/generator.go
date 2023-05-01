@@ -251,10 +251,23 @@ func generateFile(fw FileWriter, opt *Options, templateParams generatorParam, te
 
 /*
  * Find the go packages for the generated golang files relating to each
- * protocol and import them into the generated server. Because gripmock munges
- * the go_package in the proto files, this will find the ones that gripmock's
- * own protogen invocation creates in the same directory as the generated
- * server.
+ * protocol and import them into the generated server.
+ *
+ * Because gripmock munges the go_package in the proto files and puts them
+ * first in the proto path, this will prefer locally generated impls for any
+ * protos specified on the gripmock CLI.
+ *
+ * Other proto files imported by a given protocol file won't have their
+ * go_package munged, so we'll find their original upstream package name and
+ * import that in the generated server. These must then be resolve-able by go
+ * module discovery at build time, so the user may have to supply an Internet
+ * connection to download them, add "replace" directives, or specify these
+ * dependency protos on the CLI to have gripmock munge and locally generate
+ * them too.
+ *
+ * This function does NOT recurse through import statements within a given
+ * .proto file because protogen has already fully resolved the imports list and
+ * included every imported protocol into the 'protos' array for us.
  */
 func resolveImports(protos []*descriptorpb.FileDescriptorProto) map[string]string {
 
@@ -262,7 +275,7 @@ func resolveImports(protos []*descriptorpb.FileDescriptorProto) map[string]strin
 	for _, proto := range protos {
 		alias, pkg := getGoPackage(proto)
 
-		// fatal if go_package is not present
+		// go_package will always be present since we generated these files
 		if pkg == "" {
 			log.Fatalf("option go_package is required. but %s doesn't have any", proto.GetName())
 		}
@@ -270,6 +283,8 @@ func resolveImports(protos []*descriptorpb.FileDescriptorProto) map[string]strin
 		if _, ok := deps[pkg]; ok {
 			continue
 		}
+
+		log.Printf("proto: %s, dependencies: %v", proto.GetName(), proto.GetDependency())
 
 		deps[pkg] = alias
 	}

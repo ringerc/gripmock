@@ -17,6 +17,10 @@ Features:
   to provide an alternate directory for the `server.tmpl` and `go_mod.tmpl`
   files.
 
+* Support for building using locally pre-generated implementations of dependency
+  protocols. The new `-go-replace` flag takes list of `from=to` module
+  replacements in the same form as `go mod edit -replace` command.
+
 * Read OpenTelemetry trace metadata in W3C trace context or Zipkin b3 (single
   or multi) formats and emit trace spans to a trace collector if appropriate env-vars
   are set;
@@ -272,6 +276,52 @@ An error like
 from `protoc` itself indicates a bug in gripmock's protocol path resolution.
 Please raise an issue *with a fully self contained reproducible test case*
 illustrating the problem.
+
+### Resolving implementations for dependency protocols
+
+Gripmock will *not* generate golang protobuf files for protocols not explicitly
+listed on the gripmock command line.
+
+There are three ways to provide the required implementations:
+
+* Pass the dependency `.proto` files as arguments to `gripmock`, so it will
+  automatically generate the go files for them;
+* Let the `go mod tidy` command run by `gripmock` find and download them via
+  the same go module resolution as usual. This may require setting a
+  `GOPRIVATE` env-var in container runs, and possibly injecting repo access
+  credentials or API tokens into the container.
+* Pass a `-go-replace` option to `gripmock` that maps the module paths for
+  the dependencies to locally pre-generated files, usually bind-mounted into
+  a container.
+
+For example, say some protocol file `protos/src/a/a.proto` has:
+
+```
+option go_module = github.com/mycompany/protos/generated/v1/a/a.proto
+import "b/b.proto"
+```
+
+Lets assume that `protos` has subdir `src` containing the proto files, and
+`generated` containing golang modules for each proto.
+
+Running `gripmock -imports ./protos/src a/a.proto` will allow `gripmock` to
+find the required `b/b.proto` protobuf file at `protos/src/b/b.proto` but it
+won't know how to get the generated golang files for the implementation so the
+server will fail with an error like
+
+    gripmock/generated/a imports
+        github.com/mycompany/protos/generated: cannot find module providing package github.com/mycompany/protos/generated/v1/b [...]
+
+You could solve this by:
+
+* Giving the `go` runtime wherever `gripmock` is running access to
+  `github.com/mycompany/protos/generated/v1/b`, so it can download
+  pre-generated files from the Internet;
+* Explicitly listing `b/b.proto` on the gripmock argument list; or
+* Adding
+  `-replace=github.com/mycompany/protos/generated=${PWD}/protos/generated` to
+  the gripmock CLI, so module resolution for paths is re-mapped to
+  pre-generated local proto implementations.
 
 ## Stubbing
 

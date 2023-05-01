@@ -66,10 +66,11 @@ func main() {
 	adminBindAddr := flag.String("admin-listen", "", "Adress the admin server will bind to. Default to localhost, set to 0.0.0.0 to use from another machine")
 	stubPath := flag.String("stub", "", "Path where the stub files are (Optional)")
 	imports := flag.String("imports", "", "comma separated imports path to search for dependency .proto files")
+	goReplaces := flag.String("go-replace", "", "comma separated list of \"replace\" directives for finding local paths to pre-generated go protocol files")
 	logVerbosity := flag.Int("verbosity", LOG_INFO, "log verbosity [0..4], default 1")
 
 	// for backwards compatibility
-	if os.Args[1] == "gripmock" {
+	if len(os.Args) >= 2 && os.Args[1] == "gripmock" {
 		os.Args = append(os.Args[:1], os.Args[2:]...)
 	}
 
@@ -122,8 +123,13 @@ func main() {
 		os.Exit(EXITCODE_BUILD_ERROR)
 	}
 
+	var modReplacements []string
+	if *goReplaces != "" {
+		modReplacements = strings.Split(*goReplaces, ",")
+	}
+
 	// Build the server binary
-	if err := buildServer(output); err != nil {
+	if err := buildServer(output, modReplacements); err != nil {
 		log.Error(err, "building gRPC server")
 		os.Exit(EXITCODE_BUILD_ERROR)
 	}
@@ -497,7 +503,7 @@ func runGrpcServer(output string) (*exec.Cmd, <-chan error) {
 	return run, runerr
 }
 
-func buildServer(output string) error {
+func buildServer(output string, modReplacements []string) error {
 	log.V(LOG_VERBOSE).Info("Building server")
 	oldCwd, err := os.Getwd()
 	if err != nil {
@@ -513,6 +519,20 @@ func buildServer(output string) error {
 	log.V(LOG_DEBUG).Info("setting go.mod module name", "cmd", run.String())
 	if err := run.Run(); err != nil {
 		return fmt.Errorf("setting go.mod name: %w", err)
+	}
+
+	if len(modReplacements) > 0 {
+		cmd := []string{"mod", "edit"}
+		for _, r := range modReplacements {
+			cmd = append(cmd, "-replace=" + r)
+		}
+		run := exec.Command("go", cmd...)
+		run.Stdout = os.Stdout
+		run.Stderr = os.Stderr
+		log.V(LOG_DEBUG).Info("adding module replacement directives", "cmd", run.String())
+		if err := run.Run(); err != nil {
+			return fmt.Errorf("adding go.mod replacement directives: %w", err)
+		}
 	}
 
 	run = exec.Command("go", "mod", "tidy")
